@@ -1,0 +1,16 @@
+# CodeBuild가 이미지를 빌드해 ECR에 올린다. REPO_URI, IMAGE_TAG는 infra/stack.yaml에서 넣어 준다.
+version: 0.2
+
+env:
+  shell: bash
+
+phases:
+  pre_build:
+    commands:
+      - aws ecr get-login-password --region "$AWS_DEFAULT_REGION" | docker login --username AWS --password-stdin "${REPO_URI%/*}"
+  build:
+    commands:
+      - docker build -t "$REPO_URI:$IMAGE_TAG" .
+  post_build:
+    commands:
+      - docker push "$REPO_URI:$IMAGE_TAG"
