@@ -1,0 +1,530 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  RAG chatbot week 2. One ALB routes /api/food and /api/fashion to separate
+  ECS Fargate services; each service has its own task role, table and logs.
+
+Parameters:
+  Prefix:
+    Type: String
+    Default: ragbot
+  DesiredCount:
+    Type: Number
+    Default: 0
+    Description: Tasks per service. Deploy with 0 first, build the image, then 2.
+  ImageTag:
+    Type: String
+    Default: latest
+
+Resources:
+  # ---------------- Network ----------------
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.20.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{ Key: Name, Value: !Sub "${Prefix}-vpc" }]
+
+  Igw:
+    Type: AWS::EC2::InternetGateway
+  IgwAttach:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties: { VpcId: !Ref Vpc, InternetGatewayId: !Ref Igw }
+
+  PublicA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.20.0.0/24
+      AvailabilityZone: !Sub "${AWS::Region}a"
+      MapPublicIpOnLaunch: true
+      Tags: [{ Key: Name, Value: !Sub "${Prefix}-public-a" }]
+  PublicC:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.20.1.0/24
+      AvailabilityZone: !Sub "${AWS::Region}c"
+      MapPublicIpOnLaunch: true
+      Tags: [{ Key: Name, Value: !Sub "${Prefix}-public-c" }]
+  PrivateA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.20.10.0/24
+      AvailabilityZone: !Sub "${AWS::Region}a"
+      Tags: [{ Key: Name, Value: !Sub "${Prefix}-private-a" }]
+  PrivateC:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.20.11.0/24
+      AvailabilityZone: !Sub "${AWS::Region}c"
+      Tags: [{ Key: Name, Value: !Sub "${Prefix}-private-c" }]
+
+  PublicRt:
+    Type: AWS::EC2::RouteTable
+    Properties: { VpcId: !Ref Vpc }
+  PublicDefault:
+    Type: AWS::EC2::Route
+    DependsOn: IgwAttach
+    Properties:
+      RouteTableId: !Ref PublicRt
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref Igw
+  PublicAAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PublicA, RouteTableId: !Ref PublicRt }
+  PublicCAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PublicC, RouteTableId: !Ref PublicRt }
+
+  # Private subnets have no internet route (no NAT). AWS APIs go through endpoints.
+  PrivateRt:
+    Type: AWS::EC2::RouteTable
+    Properties: { VpcId: !Ref Vpc }
+  PrivateAAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PrivateA, RouteTableId: !Ref PrivateRt }
+  PrivateCAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PrivateC, RouteTableId: !Ref PrivateRt }
+
+  S3Endpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      VpcEndpointType: Gateway
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.s3"
+      RouteTableIds: [!Ref PrivateRt]
+  DynamoEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      VpcEndpointType: Gateway
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.dynamodb"
+      RouteTableIds: [!Ref PrivateRt]
+
+  EndpointSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: HTTPS from inside the VPC to interface endpoints
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: 10.20.0.0/16 }
+  EcrApiEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      VpcEndpointType: Interface
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.ecr.api"
+      SubnetIds: [!Ref PrivateA, !Ref PrivateC]
+      SecurityGroupIds: [!Ref EndpointSg]
+      PrivateDnsEnabled: true
+  EcrDkrEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      VpcEndpointType: Interface
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.ecr.dkr"
+      SubnetIds: [!Ref PrivateA, !Ref PrivateC]
+      SecurityGroupIds: [!Ref EndpointSg]
+      PrivateDnsEnabled: true
+  LogsEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      VpcEndpointType: Interface
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.logs"
+      SubnetIds: [!Ref PrivateA, !Ref PrivateC]
+      SecurityGroupIds: [!Ref EndpointSg]
+      PrivateDnsEnabled: true
+
+  AlbSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Public HTTP to ALB
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 0.0.0.0/0 }
+  TaskSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: App port only from the ALB
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 8000, ToPort: 8000, SourceSecurityGroupId: !Ref AlbSg }
+
+  # ---------------- Load balancer ----------------
+  Alb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub "${Prefix}-alb"
+      Scheme: internet-facing
+      Type: application
+      Subnets: [!Ref PublicA, !Ref PublicC]
+      SecurityGroups: [!Ref AlbSg]
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref Alb
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: fixed-response
+          FixedResponseConfig:
+            StatusCode: "404"
+            ContentType: application/json
+            MessageBody: '{"error":"use /api/food or /api/fashion"}'
+
+  FoodTg:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "${Prefix}-food-tg"
+      VpcId: !Ref Vpc
+      TargetType: ip
+      Protocol: HTTP
+      Port: 8000
+      HealthCheckPath: /api/food/health
+      HealthCheckIntervalSeconds: 15
+      HealthyThresholdCount: 2
+      TargetGroupAttributes:
+        - { Key: deregistration_delay.timeout_seconds, Value: "10" }
+  FashionTg:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "${Prefix}-fashion-tg"
+      VpcId: !Ref Vpc
+      TargetType: ip
+      Protocol: HTTP
+      Port: 8000
+      HealthCheckPath: /api/fashion/health
+      HealthCheckIntervalSeconds: 15
+      HealthyThresholdCount: 2
+      TargetGroupAttributes:
+        - { Key: deregistration_delay.timeout_seconds, Value: "10" }
+  FoodRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref Listener
+      Priority: 10
+      Conditions:
+        - { Field: path-pattern, Values: ["/api/food", "/api/food/*"] }
+      Actions:
+        - { Type: forward, TargetGroupArn: !Ref FoodTg }
+  FashionRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref Listener
+      Priority: 20
+      Conditions:
+        - { Field: path-pattern, Values: ["/api/fashion", "/api/fashion/*"] }
+      Actions:
+        - { Type: forward, TargetGroupArn: !Ref FashionTg }
+
+  # ---------------- Storage ----------------
+  ImageRepo:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub "${Prefix}-api"
+      EmptyOnDelete: true
+
+  # food/, fashion/ and their cases/ prefixes hold documents; build/ holds the build source
+  DocsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      VersioningConfiguration: { Status: Enabled }
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  FoodTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${Prefix}-food-chat"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions: [{ AttributeName: id, AttributeType: S }]
+      KeySchema: [{ AttributeName: id, KeyType: HASH }]
+      TimeToLiveSpecification: { AttributeName: expiresAt, Enabled: true }
+  FashionTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${Prefix}-fashion-chat"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions: [{ AttributeName: id, AttributeType: S }]
+      KeySchema: [{ AttributeName: id, KeyType: HASH }]
+      TimeToLiveSpecification: { AttributeName: expiresAt, Enabled: true }
+
+  FoodLogs:
+    Type: AWS::Logs::LogGroup
+    Properties: { LogGroupName: !Sub "/ecs/${Prefix}-food", RetentionInDays: 7 }
+  FashionLogs:
+    Type: AWS::Logs::LogGroup
+    Properties: { LogGroupName: !Sub "/ecs/${Prefix}-fashion", RetentionInDays: 7 }
+  BuildLogs:
+    Type: AWS::Logs::LogGroup
+    Properties: { LogGroupName: !Sub "/codebuild/${Prefix}-image-build", RetentionInDays: 7 }
+
+  # ---------------- IAM ----------------
+  TaskExecRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - { Effect: Allow, Principal: { Service: ecs-tasks.amazonaws.com }, Action: sts:AssumeRole }
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+
+  # Each task role reaches only its own service's data. Chat tables are write-only.
+  FoodTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - { Effect: Allow, Principal: { Service: ecs-tasks.amazonaws.com }, Action: sts:AssumeRole }
+      Policies:
+        - PolicyName: food-own-data
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [dynamodb:PutItem, dynamodb:UpdateItem]
+                Resource: !GetAtt FoodTable.Arn
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub "${DocsBucket.Arn}/food/*"
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt DocsBucket.Arn
+                Condition: { StringLike: { "s3:prefix": ["food/*"] } }
+  FashionTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - { Effect: Allow, Principal: { Service: ecs-tasks.amazonaws.com }, Action: sts:AssumeRole }
+      Policies:
+        - PolicyName: fashion-own-data
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [dynamodb:PutItem, dynamodb:UpdateItem]
+                Resource: !GetAtt FashionTable.Arn
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub "${DocsBucket.Arn}/fashion/*"
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt DocsBucket.Arn
+                Condition: { StringLike: { "s3:prefix": ["fashion/*"] } }
+
+  BuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - { Effect: Allow, Principal: { Service: codebuild.amazonaws.com }, Action: sts:AssumeRole }
+      Policies:
+        - PolicyName: image-build
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub "${BuildLogs.Arn}"
+              - Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:BatchGetImage
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                  - ecr:PutImage
+                Resource: !GetAtt ImageRepo.Arn
+              - Effect: Allow
+                Action: [s3:GetObject, s3:GetObjectVersion]
+                Resource: !Sub "${DocsBucket.Arn}/build/*"
+
+  # ---------------- Image build ----------------
+  BuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "${Prefix}-image-build"
+      ServiceRole: !GetAtt BuildRole.Arn
+      Artifacts: { Type: NO_ARTIFACTS }
+      Source:
+        Type: S3
+        Location: !Sub "${DocsBucket}/build/source.zip"
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - { Name: REPO_URI, Value: !GetAtt ImageRepo.RepositoryUri }
+          - { Name: IMAGE_TAG, Value: !Ref ImageTag }
+      LogsConfig:
+        CloudWatchLogs: { Status: ENABLED, GroupName: !Ref BuildLogs }
+      TimeoutInMinutes: 15
+
+  # ---------------- ECS ----------------
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub "${Prefix}-cluster"
+
+  FoodTaskDef:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${Prefix}-food"
+      Cpu: "256"
+      Memory: "512"
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      RuntimePlatform: { CpuArchitecture: X86_64, OperatingSystemFamily: LINUX }
+      ExecutionRoleArn: !GetAtt TaskExecRole.Arn
+      TaskRoleArn: !GetAtt FoodTaskRole.Arn
+      ContainerDefinitions:
+        - Name: api
+          Image: !Sub "${ImageRepo.RepositoryUri}:${ImageTag}"
+          PortMappings: [{ ContainerPort: 8000 }]
+          Environment:
+            - { Name: SERVICE_NAME, Value: food }
+            - { Name: TABLE_NAME, Value: !Ref FoodTable }
+            - { Name: AWS_DEFAULT_REGION, Value: !Ref AWS::Region }
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref FoodLogs
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: api
+  FashionTaskDef:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${Prefix}-fashion"
+      Cpu: "256"
+      Memory: "512"
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      RuntimePlatform: { CpuArchitecture: X86_64, OperatingSystemFamily: LINUX }
+      ExecutionRoleArn: !GetAtt TaskExecRole.Arn
+      TaskRoleArn: !GetAtt FashionTaskRole.Arn
+      ContainerDefinitions:
+        - Name: api
+          Image: !Sub "${ImageRepo.RepositoryUri}:${ImageTag}"
+          PortMappings: [{ ContainerPort: 8000 }]
+          Environment:
+            - { Name: SERVICE_NAME, Value: fashion }
+            - { Name: TABLE_NAME, Value: !Ref FashionTable }
+            - { Name: AWS_DEFAULT_REGION, Value: !Ref AWS::Region }
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref FashionLogs
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: api
+
+  FoodService:
+    Type: AWS::ECS::Service
+    DependsOn: [FoodRule, EcrApiEndpoint, EcrDkrEndpoint, LogsEndpoint, S3Endpoint]
+    Properties:
+      ServiceName: !Sub "${Prefix}-food"
+      Cluster: !Ref Cluster
+      LaunchType: FARGATE
+      DesiredCount: !Ref DesiredCount
+      TaskDefinition: !Ref FoodTaskDef
+      HealthCheckGracePeriodSeconds: 30
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 50
+        MaximumPercent: 200
+        DeploymentCircuitBreaker: { Enable: true, Rollback: true }
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets: [!Ref PrivateA, !Ref PrivateC]
+          SecurityGroups: [!Ref TaskSg]
+      LoadBalancers:
+        - { ContainerName: api, ContainerPort: 8000, TargetGroupArn: !Ref FoodTg }
+  FashionService:
+    Type: AWS::ECS::Service
+    DependsOn: [FashionRule, EcrApiEndpoint, EcrDkrEndpoint, LogsEndpoint, S3Endpoint]
+    Properties:
+      ServiceName: !Sub "${Prefix}-fashion"
+      Cluster: !Ref Cluster
+      LaunchType: FARGATE
+      DesiredCount: !Ref DesiredCount
+      TaskDefinition: !Ref FashionTaskDef
+      HealthCheckGracePeriodSeconds: 30
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 50
+        MaximumPercent: 200
+        DeploymentCircuitBreaker: { Enable: true, Rollback: true }
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets: [!Ref PrivateA, !Ref PrivateC]
+          SecurityGroups: [!Ref TaskSg]
+      LoadBalancers:
+        - { ContainerName: api, ContainerPort: 8000, TargetGroupArn: !Ref FashionTg }
+
+  # Per-service scaling on ALB requests per target. Min follows DesiredCount.
+  FoodScaling:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      ServiceNamespace: ecs
+      ScalableDimension: ecs:service:DesiredCount
+      ResourceId: !Sub "service/${Cluster}/${FoodService.Name}"
+      MinCapacity: !Ref DesiredCount
+      MaxCapacity: 4
+  FoodScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub "${Prefix}-food-requests"
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref FoodScaling
+      TargetTrackingScalingPolicyConfiguration:
+        TargetValue: 50
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ALBRequestCountPerTarget
+          ResourceLabel: !Sub "${Alb.LoadBalancerFullName}/${FoodTg.TargetGroupFullName}"
+  FashionScaling:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      ServiceNamespace: ecs
+      ScalableDimension: ecs:service:DesiredCount
+      ResourceId: !Sub "service/${Cluster}/${FashionService.Name}"
+      MinCapacity: !Ref DesiredCount
+      MaxCapacity: 4
+  FashionScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub "${Prefix}-fashion-requests"
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref FashionScaling
+      TargetTrackingScalingPolicyConfiguration:
+        TargetValue: 50
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ALBRequestCountPerTarget
+          ResourceLabel: !Sub "${Alb.LoadBalancerFullName}/${FashionTg.TargetGroupFullName}"
+
+Outputs:
+  AlbDns: { Value: !GetAtt Alb.DNSName }
+  Cluster: { Value: !Ref Cluster }
+  FoodService: { Value: !GetAtt FoodService.Name }
+  FashionService: { Value: !GetAtt FashionService.Name }
+  BuildProject: { Value: !Ref BuildProject }
+  DocsBucket: { Value: !Ref DocsBucket }
+  ImageRepoUri: { Value: !GetAtt ImageRepo.RepositoryUri }
+  FoodTable: { Value: !Ref FoodTable }
+  FashionTable: { Value: !Ref FashionTable }
