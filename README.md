@@ -12,6 +12,7 @@ Dockerfile          API 이미지
 buildspec.yml       CodeBuild 이미지 빌드 설정
 infra/stack.yaml    CloudFormation 스택 (VPC, ALB, ECS Fargate, IAM, S3, DynamoDB, CodeBuild)
 notebooks/          Colab 배포 노트북
+scripts/            AI Hub 상담 데이터에서 식품관, 패션관 사례를 뽑는 스크립트 (결과 data/는 커밋하지 않음)
 docs/               구성도
 ```
 
